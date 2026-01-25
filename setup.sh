@@ -126,10 +126,7 @@ for i in {0..8}; do
     tmux select-pane -t "multiagent:0.$i" -T "${PANE_TITLES[$i]}"
     tmux send-keys -t "multiagent:0.$i" "cd $(pwd)" C-m
     tmux send-keys -t "multiagent:0.$i" "export PS1='(\[\033[${PANE_COLORS[$i]}m\]${PANE_TITLES[$i]}\[\033[0m\]) \[\033[1;32m\]\w\[\033[0m\]\$ '" C-m
-    tmux send-keys -t "multiagent:0.$i" "echo ''" C-m
-    tmux send-keys -t "multiagent:0.$i" "echo '╔════════════════════════════════════╗'" C-m
-    tmux send-keys -t "multiagent:0.$i" "echo '║  ${PANE_TITLES[$i]} 参上！出陣の用意完了  ║'" C-m
-    tmux send-keys -t "multiagent:0.$i" "echo '╚════════════════════════════════════╝'" C-m
+    tmux send-keys -t "multiagent:0.$i" "clear && echo '=== ${PANE_TITLES[$i]} 参上 ==='" C-m
 done
 
 log_success "  └─ 家老・足軽の陣、構築完了"
@@ -140,13 +137,13 @@ log_war "👑 将軍の本陣を構築中..."
 tmux new-session -d -s shogun
 tmux send-keys -t shogun "cd $(pwd)" C-m
 tmux send-keys -t shogun "export PS1='(\[\033[1;35m\]将軍\[\033[0m\]) \[\033[1;32m\]\w\[\033[0m\]\$ '" C-m
+tmux send-keys -t shogun "clear" C-m
 tmux send-keys -t shogun "echo ''" C-m
-tmux send-keys -t shogun "echo '╔═══════════════════════════════════════════╗'" C-m
-tmux send-keys -t shogun "echo '║     🏯 将 軍 御 座 所 (SHOGUN HQ) 🏯      ║'" C-m
-tmux send-keys -t shogun "echo '║                                           ║'" C-m
-tmux send-keys -t shogun "echo '║       天下統一の時は近い                  ║'" C-m
-tmux send-keys -t shogun "echo '║       The time for unification is near    ║'" C-m
-tmux send-keys -t shogun "echo '╚═══════════════════════════════════════════╝'" C-m
+tmux send-keys -t shogun "echo '========================================'" C-m
+tmux send-keys -t shogun "echo '    SHOGUN HQ - 将軍御座所'" C-m
+tmux send-keys -t shogun "echo '    天下統一の時は近い'" C-m
+tmux send-keys -t shogun "echo '========================================'" C-m
+tmux send-keys -t shogun "echo ''" C-m
 
 log_success "  └─ 将軍の本陣、構築完了"
 echo ""

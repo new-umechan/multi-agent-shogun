@@ -99,15 +99,6 @@ except Exception as e:
 send_cli_command() {
     local cmd="$1"
 
-    # Get pty device for the target pane
-    local pty
-    pty=$(tmux display-message -t "$PANE_TARGET" -p '#{pane_tty}' 2>/dev/null)
-
-    if [ -z "$pty" ] || [ ! -w "$pty" ]; then
-        echo "[$(date)] WARNING: pty not available or not writable ($pty) for CLI command" >&2
-        return 1
-    fi
-
     # CLI別コマンド変換
     local actual_cmd="$cmd"
     case "$CLI_TYPE" in
@@ -121,10 +112,12 @@ send_cli_command() {
         copilot)
             # Copilot: /clearはCtrl-C+再起動, /model非対応→スキップ
             if [[ "$cmd" == "/clear" ]]; then
-                echo "[$(date)] [PTY] Copilot /clear: sending Ctrl-C + restart via pty ($pty)" >&2
-                printf '\x03' > "$pty"
+                echo "[$(date)] [SEND-KEYS] Copilot /clear: sending Ctrl-C + restart for $AGENT_ID" >&2
+                timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
                 sleep 2
-                printf '%s\n' "copilot --yolo" > "$pty"
+                timeout 5 tmux send-keys -t "$PANE_TARGET" "copilot --yolo" 2>/dev/null
+                sleep 0.3
+                timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
                 sleep 3
                 return 0
             fi
@@ -136,8 +129,13 @@ send_cli_command() {
         # claude: commands pass through as-is
     esac
 
-    echo "[$(date)] [PTY] Sending CLI command to $AGENT_ID ($CLI_TYPE) via pty ($pty): $actual_cmd" >&2
-    printf '%s\n' "$actual_cmd" > "$pty"
+    echo "[$(date)] [SEND-KEYS] Sending CLI command to $AGENT_ID ($CLI_TYPE): $actual_cmd" >&2
+    # Clear stale input first, then send command (text and Enter separated for Codex TUI)
+    timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
+    sleep 0.5
+    timeout 5 tmux send-keys -t "$PANE_TARGET" "$actual_cmd" 2>/dev/null
+    sleep 0.3
+    timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
 
     # /clear needs extra wait time before follow-up
     if [[ "$actual_cmd" == "/clear" ]]; then
@@ -155,9 +153,9 @@ agent_has_self_watch() {
 }
 
 # ─── Send wake-up nudge ───
-# Layered approach (send-keys完全廃止):
+# Layered approach:
 #   1. If agent has active inotifywait self-watch → skip (agent wakes itself)
-#   2. pty direct write → tmux完全バイパス。カーソル位置バグも起きない
+#   2. tmux send-keys (短いnudgeのみ、timeout 5s)
 send_wakeup() {
     local unread_count="$1"
     local nudge="inbox${unread_count}"
@@ -168,24 +166,22 @@ send_wakeup() {
         return 0
     fi
 
-    # 優先度2: pty direct write — tmuxを完全バイパス
-    local pty
-    pty=$(tmux display-message -t "$PANE_TARGET" -p '#{pane_tty}' 2>/dev/null)
-
-    if [ -n "$pty" ] && [ -w "$pty" ]; then
-        echo "[$(date)] [PTY] Writing nudge directly to $pty for $AGENT_ID" >&2
-        printf '%s\n' "$nudge" > "$pty"
-        echo "[$(date)] Wake-up sent to $AGENT_ID (${unread_count} unread via pty direct write)" >&2
+    # 優先度2: tmux send-keys（テキストとEnterを分離 — Codex TUI対策）
+    echo "[$(date)] [SEND-KEYS] Sending nudge to $PANE_TARGET for $AGENT_ID" >&2
+    if timeout 5 tmux send-keys -t "$PANE_TARGET" "$nudge" 2>/dev/null; then
+        sleep 0.3
+        timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
+        echo "[$(date)] Wake-up sent to $AGENT_ID (${unread_count} unread)" >&2
         return 0
     fi
 
-    echo "[$(date)] WARNING: pty not available or not writable ($pty) for $AGENT_ID" >&2
+    echo "[$(date)] WARNING: send-keys failed or timed out for $AGENT_ID" >&2
     return 1
 }
 
 # ─── Send wake-up nudge with Escape prefix ───
-# Phase 2 escalation: send Escape×2 to clear stuck cursor, then nudge.
-# Addresses the "echo last tool call" cursor position bug.
+# Phase 2 escalation: send Escape×2 + C-c to clear stuck input, then nudge.
+# Addresses the "echo last tool call" cursor position bug and stale input.
 send_wakeup_with_escape() {
     local unread_count="$1"
     local nudge="inbox${unread_count}"
@@ -194,19 +190,20 @@ send_wakeup_with_escape() {
         return 0
     fi
 
-    local pty
-    pty=$(tmux display-message -t "$PANE_TARGET" -p '#{pane_tty}' 2>/dev/null)
-
-    if [ -n "$pty" ] && [ -w "$pty" ]; then
-        echo "[$(date)] [PTY] ESCALATION Phase 2: Escape×2 + nudge to $pty for $AGENT_ID" >&2
-        printf '\x1b\x1b' > "$pty"
-        sleep 1
-        printf '%s\n' "$nudge" > "$pty"
+    echo "[$(date)] [SEND-KEYS] ESCALATION Phase 2: Escape×2 + C-c + nudge for $AGENT_ID" >&2
+    # Escape×2 to exit any mode, C-c to clear stale input
+    timeout 5 tmux send-keys -t "$PANE_TARGET" Escape Escape 2>/dev/null
+    sleep 0.5
+    timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
+    sleep 0.5
+    if timeout 5 tmux send-keys -t "$PANE_TARGET" "$nudge" 2>/dev/null; then
+        sleep 0.3
+        timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
         echo "[$(date)] Escape+nudge sent to $AGENT_ID (${unread_count} unread)" >&2
         return 0
     fi
 
-    echo "[$(date)] WARNING: pty not available for Escape+nudge ($AGENT_ID)" >&2
+    echo "[$(date)] WARNING: send-keys failed for Escape+nudge ($AGENT_ID)" >&2
     return 1
 }
 

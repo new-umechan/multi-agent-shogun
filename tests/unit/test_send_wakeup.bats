@@ -1,19 +1,19 @@
 #!/usr/bin/env bats
 # test_send_wakeup.bats — send_wakeup() unit tests
-# pty direct write: tmux完全バイパス、send-keys不使用
+# tmux send-keys方式: 短いnudge + Enter, timeout 5s
 #
 # テスト構成:
 #   T-SW-001: send_wakeup — active self-watch → skip nudge
-#   T-SW-002: send_wakeup — no self-watch → pty direct write
-#   T-SW-003: send_wakeup — pty write content is "inboxN\n"
-#   T-SW-004: send_wakeup — pty not writable → return 1
-#   T-SW-005: send_wakeup — no paste-buffer or send-keys used for nudge
+#   T-SW-002: send_wakeup — no self-watch → tmux send-keys
+#   T-SW-003: send_wakeup — send-keys content is "inboxN" + Enter
+#   T-SW-004: send_wakeup — send-keys failure → return 1
+#   T-SW-005: send_wakeup — no paste-buffer or set-buffer used
 #   T-SW-006: agent_has_self_watch — detects inotifywait process
 #   T-SW-007: agent_has_self_watch — no inotifywait → returns 1
-#   T-SW-008: send_cli_command — /clear uses pty direct write
-#   T-SW-009: send_cli_command — /model uses pty direct write
+#   T-SW-008: send_cli_command — /clear uses send-keys
+#   T-SW-009: send_cli_command — /model uses send-keys
 #   T-SW-010: nudge content format — inboxN (backward compatible)
-#   T-SW-011: backward compat — functions exist in inbox_watcher.sh
+#   T-SW-011: inbox_watcher.sh uses send-keys, functions exist
 #   T-ESC-001: escalation — no unread → FIRST_UNREAD_SEEN stays 0
 #   T-ESC-002: escalation — unread < 2min → standard nudge
 #   T-ESC-003: escalation — unread 2-4min → Escape+nudge
@@ -36,23 +36,22 @@ setup() {
     export MOCK_LOG="$TEST_TMPDIR/tmux_calls.log"
     > "$MOCK_LOG"
 
-    # Log file for pty writes
-    export PTY_LOG="$TEST_TMPDIR/pty_writes.log"
+    # Log file for action tracking
+    export PTY_LOG="$TEST_TMPDIR/action_log.log"
     > "$PTY_LOG"
 
-    # Create a fake pty device (regular file for testing)
-    export FAKE_PTY="$TEST_TMPDIR/fake_pty"
-    > "$FAKE_PTY"
-    chmod a+w "$FAKE_PTY"
-
-    # Create mock tmux that logs calls and returns fake pty path
+    # Create mock tmux that logs all calls
     export MOCK_TMUX="$TEST_TMPDIR/mock_tmux"
-    cat > "$MOCK_TMUX" << MOCK
+    cat > "$MOCK_TMUX" << 'MOCK'
 #!/bin/bash
-echo "tmux \$*" >> "$MOCK_LOG"
-# display-message for pane_tty returns our fake pty
-if echo "\$*" | grep -q "pane_tty"; then
-    echo "$FAKE_PTY"
+echo "tmux $*" >> "$MOCK_LOG"
+# send-keys always succeeds
+if echo "$*" | grep -q "send-keys"; then
+    exit 0
+fi
+# display-message returns something
+if echo "$*" | grep -q "display-message"; then
+    echo "mock_pane"
     exit 0
 fi
 exit 0
@@ -76,21 +75,6 @@ exit 1
 MOCK
     chmod +x "$MOCK_PGREP"
 
-    # Create mock printf that logs writes to pty
-    export MOCK_PRINTF_WRAPPER="$TEST_TMPDIR/mock_printf_wrapper.sh"
-    cat > "$MOCK_PRINTF_WRAPPER" << MOCK
-#!/bin/bash
-# Intercept printf redirections to fake pty and log them
-builtin_printf() {
-    local fmt="\$1"
-    shift
-    # Use builtin printf for the actual formatting
-    local formatted
-    formatted=\$(command printf "\$fmt" "\$@")
-    echo "\$formatted"
-}
-MOCK
-
     # Create test inbox
     export TEST_INBOX_DIR="$TEST_TMPDIR/queue/inbox"
     mkdir -p "$TEST_INBOX_DIR"
@@ -110,14 +94,15 @@ SCRIPT_DIR="$PROJECT_ROOT"
 tmux() { "$MOCK_TMUX" "\$@"; }
 timeout() { "$MOCK_TIMEOUT" "\$@"; }
 pgrep() { "$MOCK_PGREP" "\$@"; }
-export -f tmux timeout pgrep
+sleep() { :; }  # skip sleeps in tests
+export -f tmux timeout pgrep sleep
 
 # agent_has_self_watch
 agent_has_self_watch() {
     pgrep -f "inotifywait.*inbox/\${AGENT_ID}.yaml" >/dev/null 2>&1
 }
 
-# send_wakeup — pty direct write (send-keys完全廃止)
+# send_wakeup — tmux send-keys (短いnudge + Enter, timeout 5s)
 send_wakeup() {
     local unread_count="\$1"
     local nudge="inbox\${unread_count}"
@@ -127,38 +112,26 @@ send_wakeup() {
         return 0
     fi
 
-    # pty direct write
-    local pty
-    pty=\$(tmux display-message -t "\$PANE_TARGET" -p '#{pane_tty}' 2>/dev/null)
-
-    if [ -n "\$pty" ] && [ -w "\$pty" ]; then
-        echo "[PTY] Writing nudge directly to \$pty for \$AGENT_ID" >&2
-        printf '%s\n' "\$nudge" > "\$pty"
-        echo "PTY_WRITE:\$nudge" >> "$PTY_LOG"
-        echo "[OK] Wake-up sent to \$AGENT_ID (\${unread_count} unread via pty)" >&2
+    echo "[SEND-KEYS] Sending nudge to \$PANE_TARGET for \$AGENT_ID" >&2
+    if timeout 5 tmux send-keys -t "\$PANE_TARGET" "\$nudge" Enter 2>/dev/null; then
+        echo "SENDKEYS_NUDGE:\$nudge" >> "$PTY_LOG"
+        echo "[OK] Wake-up sent to \$AGENT_ID (\${unread_count} unread)" >&2
         return 0
     fi
 
-    echo "[WARN] pty not available or not writable (\$pty)" >&2
+    echo "[WARN] send-keys failed" >&2
     return 1
 }
 
-# send_cli_command — pty direct write (send-keys完全廃止)
+# send_cli_command — tmux send-keys with C-c prefix
 send_cli_command() {
     local cmd="\$1"
-
-    local pty
-    pty=\$(tmux display-message -t "\$PANE_TARGET" -p '#{pane_tty}' 2>/dev/null)
-
-    if [ -z "\$pty" ] || [ ! -w "\$pty" ]; then
-        echo "[WARN] pty not available for CLI command" >&2
-        return 1
-    fi
-
     local actual_cmd="\$cmd"
-    echo "[PTY] Sending CLI command: \$actual_cmd via \$pty" >&2
-    printf '%s\n' "\$actual_cmd" > "\$pty"
-    echo "PTY_CLI:\$actual_cmd" >> "$PTY_LOG"
+
+    echo "[SEND-KEYS] Sending CLI command: \$actual_cmd" >&2
+    timeout 5 tmux send-keys -t "\$PANE_TARGET" C-c 2>/dev/null
+    timeout 5 tmux send-keys -t "\$PANE_TARGET" "\$actual_cmd" Enter 2>/dev/null
+    echo "SENDKEYS_CLI:\$actual_cmd" >> "$PTY_LOG"
     return 0
 }
 
@@ -169,7 +142,7 @@ ESCALATE_PHASE1=120
 ESCALATE_PHASE2=240
 ESCALATE_COOLDOWN=300
 
-# send_wakeup_with_escape — Escape×2 + nudge
+# send_wakeup_with_escape — Escape×2 + C-c + nudge
 send_wakeup_with_escape() {
     local unread_count="\$1"
     local nudge="inbox\${unread_count}"
@@ -178,14 +151,10 @@ send_wakeup_with_escape() {
         return 0
     fi
 
-    local pty
-    pty=\$(tmux display-message -t "\$PANE_TARGET" -p '#{pane_tty}' 2>/dev/null)
-
-    if [ -n "\$pty" ] && [ -w "\$pty" ]; then
-        printf '\x1b\x1b' > "\$pty"
-        sleep 0.1  # shortened for tests
-        printf '%s\n' "\$nudge" > "\$pty"
-        echo "PTY_ESC_WRITE:\$nudge" >> "$PTY_LOG"
+    timeout 5 tmux send-keys -t "\$PANE_TARGET" Escape Escape 2>/dev/null
+    timeout 5 tmux send-keys -t "\$PANE_TARGET" C-c 2>/dev/null
+    if timeout 5 tmux send-keys -t "\$PANE_TARGET" "\$nudge" Enter 2>/dev/null; then
+        echo "SENDKEYS_ESC_NUDGE:\$nudge" >> "$PTY_LOG"
         return 0
     fi
     return 1
@@ -211,62 +180,68 @@ MOCK
     run bash -c "source '$TEST_HARNESS' && send_wakeup 3"
     [ "$status" -eq 0 ]
 
-    # No pty write should have occurred
+    # No send-keys should have occurred
     [ ! -s "$PTY_LOG" ]
 
     echo "$output" | grep -q "SKIP"
 }
 
-# --- T-SW-002: no self-watch → pty direct write ---
+# --- T-SW-002: no self-watch → tmux send-keys ---
 
-@test "T-SW-002: send_wakeup uses pty direct write when no self-watch" {
+@test "T-SW-002: send_wakeup uses tmux send-keys when no self-watch" {
     run bash -c "source '$TEST_HARNESS' && send_wakeup 5"
     [ "$status" -eq 0 ]
 
-    # Verify pty write occurred
+    # Verify send-keys occurred
     [ -s "$PTY_LOG" ]
-    grep -q "PTY_WRITE:inbox5" "$PTY_LOG"
+    grep -q "SENDKEYS_NUDGE:inbox5" "$PTY_LOG"
 
-    echo "$output" | grep -q "PTY"
+    # Verify tmux send-keys was called
+    grep -q "send-keys" "$MOCK_LOG"
 }
 
-# --- T-SW-003: pty write content is "inboxN" ---
+# --- T-SW-003: send-keys content is "inboxN" + Enter ---
 
-@test "T-SW-003: pty direct write content is inboxN format" {
+@test "T-SW-003: send-keys content is inboxN format with Enter" {
     run bash -c "source '$TEST_HARNESS' && send_wakeup 3"
     [ "$status" -eq 0 ]
 
-    # Verify the actual content written to fake pty
-    grep -q "inbox3" "$FAKE_PTY"
+    # Verify the send-keys call includes inbox3 and Enter
+    grep -q "send-keys.*inbox3.*Enter" "$MOCK_LOG"
 }
 
-# --- T-SW-004: pty not writable → return 1 ---
+# --- T-SW-004: send-keys failure → return 1 ---
 
-@test "T-SW-004: send_wakeup returns 1 when pty is not writable" {
-    chmod a-w "$FAKE_PTY"
+@test "T-SW-004: send_wakeup returns 1 when send-keys fails" {
+    # Make mock tmux fail for send-keys
+    cat > "$MOCK_TMUX" << 'MOCK'
+#!/bin/bash
+echo "tmux $*" >> "$MOCK_LOG"
+if echo "$*" | grep -q "send-keys"; then
+    exit 1
+fi
+exit 0
+MOCK
+    chmod +x "$MOCK_TMUX"
 
     run bash -c "source '$TEST_HARNESS' && send_wakeup 2"
     [ "$status" -eq 1 ]
 
-    echo "$output" | grep -qi "WARN\|not writable"
-
-    # Restore permissions for cleanup
-    chmod a+w "$FAKE_PTY"
+    echo "$output" | grep -qi "WARN\|failed"
 }
 
-# --- T-SW-005: no paste-buffer or send-keys used for nudge ---
+# --- T-SW-005: no paste-buffer or set-buffer used ---
 
-@test "T-SW-005: nudge delivery does NOT use paste-buffer or send-keys" {
+@test "T-SW-005: nudge delivery does NOT use paste-buffer or set-buffer" {
     run bash -c "source '$TEST_HARNESS' && send_wakeup 3"
     [ "$status" -eq 0 ]
 
-    # Only tmux call should be display-message for pty path
+    # These should never be used
     ! grep -q "paste-buffer" "$MOCK_LOG"
-    ! grep -q "send-keys" "$MOCK_LOG"
     ! grep -q "set-buffer" "$MOCK_LOG"
 
-    # display-message IS expected (to get pty path)
-    grep -q "display-message" "$MOCK_LOG"
+    # send-keys IS expected
+    grep -q "send-keys" "$MOCK_LOG"
 }
 
 # --- T-SW-006: agent_has_self_watch — detects inotifywait ---
@@ -290,30 +265,28 @@ MOCK
     [ "$status" -eq 1 ]
 }
 
-# --- T-SW-008: /clear uses pty direct write (no send-keys) ---
+# --- T-SW-008: /clear uses send-keys ---
 
-@test "T-SW-008: send_cli_command /clear uses pty direct write" {
+@test "T-SW-008: send_cli_command /clear uses tmux send-keys" {
     run bash -c "source '$TEST_HARNESS' && send_cli_command /clear"
     [ "$status" -eq 0 ]
 
-    # Verify pty write occurred
-    grep -q "PTY_CLI:/clear" "$PTY_LOG"
+    # Verify send-keys was used
+    grep -q "SENDKEYS_CLI:/clear" "$PTY_LOG"
+    grep -q "send-keys" "$MOCK_LOG"
 
-    # Verify NO send-keys used
-    ! grep -q "send-keys" "$MOCK_LOG"
-
-    # Verify /clear was written to fake pty
-    grep -q "/clear" "$FAKE_PTY"
+    # Verify /clear was in the send-keys call
+    grep -q "send-keys.*/clear.*Enter" "$MOCK_LOG"
 }
 
-# --- T-SW-009: /model uses pty direct write (no send-keys) ---
+# --- T-SW-009: /model uses send-keys ---
 
-@test "T-SW-009: send_cli_command /model uses pty direct write" {
+@test "T-SW-009: send_cli_command /model uses tmux send-keys" {
     run bash -c "source '$TEST_HARNESS' && send_cli_command '/model opus'"
     [ "$status" -eq 0 ]
 
-    grep -q "PTY_CLI:/model opus" "$PTY_LOG"
-    ! grep -q "send-keys" "$MOCK_LOG"
+    grep -q "SENDKEYS_CLI:/model opus" "$PTY_LOG"
+    grep -q "send-keys" "$MOCK_LOG"
 }
 
 # --- T-SW-010: nudge content format ---
@@ -322,21 +295,23 @@ MOCK
     run bash -c "source '$TEST_HARNESS' && send_wakeup 7"
     [ "$status" -eq 0 ]
 
-    grep -q "PTY_WRITE:inbox7" "$PTY_LOG"
+    grep -q "SENDKEYS_NUDGE:inbox7" "$PTY_LOG"
 }
 
-# --- T-SW-011: backward compat — functions exist ---
+# --- T-SW-011: functions exist in inbox_watcher.sh ---
 
-@test "T-SW-011: inbox_watcher.sh uses pty direct write, no send-keys in executable code" {
+@test "T-SW-011: inbox_watcher.sh uses send-keys with required functions" {
     grep -q "send_wakeup()" "$WATCHER_SCRIPT"
     grep -q "agent_has_self_watch" "$WATCHER_SCRIPT"
-    grep -q "pane_tty" "$WATCHER_SCRIPT"
+    grep -q "send_wakeup_with_escape()" "$WATCHER_SCRIPT"
+    grep -q "send_cli_command()" "$WATCHER_SCRIPT"
 
-    # No send-keys in executable code (only in comments)
-    # Strip comments, then check
+    # send-keys IS used in executable code
     local executable_lines
     executable_lines=$(grep -v '^\s*#' "$WATCHER_SCRIPT")
-    ! echo "$executable_lines" | grep -q "send-keys"
+    echo "$executable_lines" | grep -q "send-keys"
+
+    # paste-buffer and set-buffer are NOT used
     ! echo "$executable_lines" | grep -q "paste-buffer"
     ! echo "$executable_lines" | grep -q "set-buffer"
 }
@@ -375,9 +350,9 @@ MOCK
     '
     [ "$status" -eq 0 ]
     echo "$output" | grep -q "PHASE1_NUDGE"
-    grep -q "PTY_WRITE:inbox2" "$PTY_LOG"
-    ! grep -q "PTY_ESC_WRITE" "$PTY_LOG"
-    ! grep -q "PTY_CLI" "$PTY_LOG"
+    grep -q "SENDKEYS_NUDGE:inbox2" "$PTY_LOG"
+    ! grep -q "SENDKEYS_ESC_NUDGE" "$PTY_LOG"
+    ! grep -q "SENDKEYS_CLI" "$PTY_LOG"
 }
 
 # --- T-ESC-003: unread 2-4min → Escape+nudge ---
@@ -395,8 +370,8 @@ MOCK
     '
     [ "$status" -eq 0 ]
     echo "$output" | grep -q "PHASE2_ESCAPE_NUDGE"
-    grep -q "PTY_ESC_WRITE:inbox3" "$PTY_LOG"
-    ! grep -q "PTY_CLI" "$PTY_LOG"
+    grep -q "SENDKEYS_ESC_NUDGE:inbox3" "$PTY_LOG"
+    ! grep -q "SENDKEYS_CLI" "$PTY_LOG"
 }
 
 # --- T-ESC-004: unread > 4min → /clear sent ---
@@ -415,7 +390,7 @@ MOCK
     '
     [ "$status" -eq 0 ]
     echo "$output" | grep -q "PHASE3_CLEAR"
-    grep -q "PTY_CLI:/clear" "$PTY_LOG"
+    grep -q "SENDKEYS_CLI:/clear" "$PTY_LOG"
 }
 
 # --- T-ESC-005: /clear cooldown → falls back to Escape+nudge ---
@@ -434,6 +409,6 @@ MOCK
     '
     [ "$status" -eq 0 ]
     echo "$output" | grep -q "COOLDOWN_FALLBACK"
-    grep -q "PTY_ESC_WRITE:inbox4" "$PTY_LOG"
-    ! grep -q "PTY_CLI" "$PTY_LOG"
+    grep -q "SENDKEYS_ESC_NUDGE:inbox4" "$PTY_LOG"
+    ! grep -q "SENDKEYS_CLI" "$PTY_LOG"
 }

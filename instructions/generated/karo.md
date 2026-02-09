@@ -235,15 +235,14 @@ Two layers:
 1. **Message persistence**: `inbox_write.sh` writes to `queue/inbox/{agent}.yaml` with flock. Guaranteed.
 2. **Wake-up signal**: `inbox_watcher.sh` detects file change via `inotifywait` → wakes agent:
    - **優先度1**: Agent self-watch (agent's own `inotifywait` on its inbox) → no nudge needed
-   - **優先度2**: pty direct write → `printf "inboxN\n" > /dev/pts/X` — tmux完全バイパス
+   - **優先度2**: `tmux send-keys` — short nudge only (text and Enter sent separately, 0.3s gap)
 
 The nudge is minimal: `inboxN` (e.g. `inbox3` = 3 unread). That's it.
 **Agent reads the inbox file itself.** Message content never travels through tmux — only a short wake-up signal.
-**send-keys is NOT used for nudge delivery.** Nudge goes directly to the pty device.
 
-Special cases (CLI commands sent via pty direct write):
-- `type: clear_command` → writes `/clear` + newline to pty, then follow-up content
-- `type: model_switch` → writes the /model command to pty
+Special cases (CLI commands sent via `tmux send-keys`):
+- `type: clear_command` → sends `/clear` + Enter via send-keys
+- `type: model_switch` → sends the /model command via send-keys
 
 **Escalation** (when nudge is not processed):
 

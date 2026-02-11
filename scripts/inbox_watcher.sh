@@ -439,6 +439,11 @@ agent_is_busy() {
         return 0  # busy
     fi
 
+    # Codex sometimes shows this when a tool/terminal is running in the background.
+    if echo "$pane_content" | grep -qiF 'background terminal running'; then
+        return 0  # busy
+    fi
+
     # Minimal fallbacks (no spinner dependency).
     if echo "$pane_content" | grep -qiE '(Working|Thinking|Planning|Sending|task is in progress|Compacting conversation|thought for|思考中|考え中|計画中|送信中|処理中|実行中)'; then
         return 0  # busy

@@ -9,6 +9,11 @@ cd "$SCRIPT_DIR"
 
 mkdir -p logs queue/inbox
 
+ASHIGARU_COUNT=$(grep "^ashigaru_count:" config/settings.yaml 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "3")
+if ! [[ "$ASHIGARU_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    ASHIGARU_COUNT=3
+fi
+
 ensure_inbox_file() {
     local agent="$1"
     if [ ! -f "queue/inbox/${agent}.yaml" ]; then
@@ -41,15 +46,15 @@ start_watcher_if_missing() {
 }
 
 while true; do
+    pane_base=$(tmux show-options -gv pane-base-index 2>/dev/null || echo 0)
+
     start_watcher_if_missing "shogun" "shogun:main.0" "logs/inbox_watcher_shogun.log"
-    start_watcher_if_missing "karo" "multiagent:agents.0" "logs/inbox_watcher_karo.log"
-    start_watcher_if_missing "ashigaru1" "multiagent:agents.1" "logs/inbox_watcher_ashigaru1.log"
-    start_watcher_if_missing "ashigaru2" "multiagent:agents.2" "logs/inbox_watcher_ashigaru2.log"
-    start_watcher_if_missing "ashigaru3" "multiagent:agents.3" "logs/inbox_watcher_ashigaru3.log"
-    start_watcher_if_missing "ashigaru4" "multiagent:agents.4" "logs/inbox_watcher_ashigaru4.log"
-    start_watcher_if_missing "ashigaru5" "multiagent:agents.5" "logs/inbox_watcher_ashigaru5.log"
-    start_watcher_if_missing "ashigaru6" "multiagent:agents.6" "logs/inbox_watcher_ashigaru6.log"
-    start_watcher_if_missing "ashigaru7" "multiagent:agents.7" "logs/inbox_watcher_ashigaru7.log"
-    start_watcher_if_missing "ashigaru8" "multiagent:agents.8" "logs/inbox_watcher_ashigaru8.log"
+    start_watcher_if_missing "karo" "multiagent:agents.${pane_base}" "logs/inbox_watcher_karo.log"
+
+    for i in $(seq 1 "$ASHIGARU_COUNT"); do
+        pane=$((pane_base + i))
+        start_watcher_if_missing "ashigaru${i}" "multiagent:agents.${pane}" "logs/inbox_watcher_ashigaru${i}.log"
+    done
+
     sleep 5
 done

@@ -47,10 +47,6 @@ parallel_principle: "足軽は可能な限り並列投入。家老は統括専�
 std_process: "Strategy→Spec→Test→Implement→Verify を全cmdの標準手順とする"
 critical_thinking_principle: "家老・足軽は盲目的に従わず前提を検証し、代替案を提案する。ただし過剰批判で停止せず、実行可能性とのバランスを保つ。"
 
-language:
-  ja: "戦国風日本語のみ。「はっ！」「承知つかまつった」「任務完了でござる」"
-  other: "戦国風 + translation in parens. 「はっ！ (Ha!)」「任務完了でござる (Task completed!)」"
-  config: "config/settings.yaml → language field"
 ---
 
 # Procedures

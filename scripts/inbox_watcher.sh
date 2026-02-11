@@ -10,7 +10,7 @@
 #   エージェントが自分でinboxをReadして処理する
 #   冪等: 2回届いてもunreadがなければ何もしない
 #
-# inotifywait でファイル変更を検知（イベント駆動、ポーリングではない）
+# inotifywait/fswatch でファイル変更を検知（イベント駆動、ポーリングではない）
 # Fallback 1: 30秒タイムアウト（WSL2 inotify不発時の安全網）
 # Fallback 2: rc=1処理（Claude Code atomic write = tmp+rename でinode変更時）
 #
@@ -48,11 +48,6 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
 
     echo "[$(date)] inbox_watcher started — agent: $AGENT_ID, pane: $PANE_TARGET, cli: $CLI_TYPE" >&2
 
-    # Ensure inotifywait is available
-    if ! command -v inotifywait &>/dev/null; then
-        echo "[inbox_watcher] ERROR: inotifywait not found. Install: sudo apt install inotify-tools" >&2
-        exit 1
-    fi
 fi
 
 # ─── Escalation state ───
@@ -86,6 +81,10 @@ ASW_NO_IDLE_FULL_READ=${ASW_NO_IDLE_FULL_READ:-1}
 # - ASW_PROCESS_TIMEOUT=0: do not process unread on timeout ticks (event-only)
 ASW_DISABLE_ESCALATION=${ASW_DISABLE_ESCALATION:-0}
 ASW_PROCESS_TIMEOUT=${ASW_PROCESS_TIMEOUT:-1}
+INBOX_WATCH_BACKEND=${INBOX_WATCH_BACKEND:-auto}
+INBOX_WATCH_TIMEOUT_SEC=${INBOX_WATCH_TIMEOUT_SEC:-30}
+INBOX_AUTO_INSTALL_FSWATCH=${INBOX_AUTO_INSTALL_FSWATCH:-1}
+WATCH_BACKEND=${WATCH_BACKEND:-}
 
 # ─── Metrics hooks (FR-006 / NFR-003) ───
 # unread_latency_sec / read_count / estimated_tokens are intentionally explicit
@@ -117,6 +116,164 @@ read_count: $READ_COUNT
 bytes_read: $READ_BYTES_TOTAL
 estimated_tokens: $ESTIMATED_TOKENS_TOTAL
 EOF
+}
+
+# ─── Timeout compatibility wrapper ───
+# Linux: timeout, macOS(coreutils): gtimeout. If none exists, run command directly.
+run_timeout() {
+    local seconds="$1"
+    shift
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+        return $?
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$seconds" "$@"
+        return $?
+    fi
+    "$@"
+}
+
+is_darwin() {
+    [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ]
+}
+
+install_fswatch_with_brew() {
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "[inbox_watcher] ERROR: brew not found. Install Homebrew and run: brew install fswatch" >&2
+        return 1
+    fi
+
+    echo "[inbox_watcher] INFO: fswatch not found. Trying auto-install via brew..." >&2
+    if brew install fswatch >/dev/null 2>&1; then
+        echo "[inbox_watcher] INFO: fswatch installed successfully." >&2
+        return 0
+    fi
+
+    echo "[inbox_watcher] ERROR: failed to auto-install fswatch. Run manually: brew install fswatch" >&2
+    return 1
+}
+
+resolve_watch_backend() {
+    local requested="${INBOX_WATCH_BACKEND:-auto}"
+
+    case "$requested" in
+        auto|inotify|fswatch) ;;
+        *)
+            echo "[inbox_watcher] WARN: invalid INBOX_WATCH_BACKEND='$requested'. Fallback to auto." >&2
+            requested="auto"
+            ;;
+    esac
+
+    if [ "$requested" = "inotify" ]; then
+        if command -v inotifywait >/dev/null 2>&1; then
+            WATCH_BACKEND="inotify"
+            return 0
+        fi
+        echo "[inbox_watcher] ERROR: backend=inotify requested, but inotifywait is missing." >&2
+        echo "[inbox_watcher] Install: sudo apt install inotify-tools" >&2
+        return 1
+    fi
+
+    if [ "$requested" = "fswatch" ]; then
+        if command -v fswatch >/dev/null 2>&1; then
+            WATCH_BACKEND="fswatch"
+            return 0
+        fi
+        if [ "${INBOX_AUTO_INSTALL_FSWATCH:-1}" = "1" ]; then
+            install_fswatch_with_brew || return 1
+            command -v fswatch >/dev/null 2>&1 || return 1
+            WATCH_BACKEND="fswatch"
+            return 0
+        fi
+        echo "[inbox_watcher] ERROR: backend=fswatch requested, but fswatch is missing." >&2
+        echo "[inbox_watcher] Install: brew install fswatch" >&2
+        return 1
+    fi
+
+    if command -v inotifywait >/dev/null 2>&1; then
+        WATCH_BACKEND="inotify"
+        return 0
+    fi
+
+    if is_darwin; then
+        if command -v fswatch >/dev/null 2>&1; then
+            WATCH_BACKEND="fswatch"
+            return 0
+        fi
+        if [ "${INBOX_AUTO_INSTALL_FSWATCH:-1}" = "1" ]; then
+            install_fswatch_with_brew || return 1
+            command -v fswatch >/dev/null 2>&1 || return 1
+            WATCH_BACKEND="fswatch"
+            return 0
+        fi
+        echo "[inbox_watcher] ERROR: fswatch is required on macOS when inotifywait is unavailable." >&2
+        echo "[inbox_watcher] Install: brew install fswatch" >&2
+        return 1
+    fi
+
+    echo "[inbox_watcher] ERROR: no supported watcher backend found." >&2
+    echo "[inbox_watcher] Install inotifywait (sudo apt install inotify-tools)." >&2
+    return 1
+}
+
+wait_for_inbox_event() {
+    local watch_timeout="${INBOX_WATCH_TIMEOUT_SEC:-30}"
+
+    if [ "${WATCH_BACKEND:-}" = "inotify" ]; then
+        # rc=0 event, rc=1 watch invalidated, rc=2 timeout
+        inotifywait -q -t "$watch_timeout" -e modify -e close_write "$INBOX" 2>/dev/null
+        local rc=$?
+        if [ "$rc" -eq 2 ]; then
+            return 2
+        fi
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; then
+            return 0
+        fi
+        return 1
+    fi
+
+    if [ "${WATCH_BACKEND:-}" = "fswatch" ]; then
+        local event_file
+        event_file="$(mktemp "${TMPDIR:-/tmp}/inbox_watcher_event.XXXXXX")"
+        local timeout_file
+        timeout_file="$(mktemp "${TMPDIR:-/tmp}/inbox_watcher_timeout.XXXXXX")"
+        local watcher_pid=0
+        local timer_pid=0
+        local rc=1
+
+        # fswatch waits until a single event arrives.
+        fswatch -1 "$INBOX" >"$event_file" 2>/dev/null &
+        watcher_pid=$!
+        (
+            sleep "$watch_timeout"
+            if kill -0 "$watcher_pid" 2>/dev/null; then
+                echo "timeout" > "$timeout_file"
+                kill "$watcher_pid" 2>/dev/null || true
+            fi
+        ) &
+        timer_pid=$!
+
+        wait "$watcher_pid" 2>/dev/null
+        rc=$?
+        kill "$timer_pid" 2>/dev/null || true
+        wait "$timer_pid" 2>/dev/null || true
+
+        if [ -s "$timeout_file" ]; then
+            rm -f "$event_file" "$timeout_file"
+            return 2
+        fi
+
+        rm -f "$event_file" "$timeout_file"
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 143 ] || [ "$rc" -eq 130 ]; then
+            return 0
+        fi
+        return 1
+    fi
+
+    echo "[inbox_watcher] ERROR: WATCH_BACKEND is not initialized." >&2
+    return 1
 }
 
 disable_normal_nudge() {
@@ -160,7 +317,7 @@ get_effective_cli_type() {
     local pane_cli_raw=""
     local pane_cli=""
 
-    pane_cli_raw=$(timeout 2 tmux show-options -p -t "$PANE_TARGET" -v @agent_cli 2>/dev/null || true)
+    pane_cli_raw=$(run_timeout 2 tmux show-options -p -t "$PANE_TARGET" -v @agent_cli 2>/dev/null || true)
     pane_cli=$(echo "$pane_cli_raw" | tr -d '\r' | head -n1 | tr -d '[:space:]')
 
     if is_valid_cli_type "$pane_cli"; then
@@ -365,9 +522,9 @@ send_cli_command() {
             # /clearはCodexでは未定義コマンドでCLI終了してしまうため、/newに変換
             if [[ "$cmd" == "/clear" ]]; then
                 echo "[$(date)] [SEND-KEYS] Codex /clear→/new: starting new conversation for $AGENT_ID" >&2
-                timeout 5 tmux send-keys -t "$PANE_TARGET" "/new" 2>/dev/null
+                run_timeout 5 tmux send-keys -t "$PANE_TARGET" "/new" 2>/dev/null
                 sleep 0.3
-                timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
+                run_timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
                 sleep 3
                 return 0
             fi
@@ -380,11 +537,11 @@ send_cli_command() {
             # Copilot: /clearはCtrl-C+再起動, /model非対応→スキップ
             if [[ "$cmd" == "/clear" ]]; then
                 echo "[$(date)] [SEND-KEYS] Copilot /clear: sending Ctrl-C + restart for $AGENT_ID" >&2
-                timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
+                run_timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
                 sleep 2
-                timeout 5 tmux send-keys -t "$PANE_TARGET" "copilot --yolo" 2>/dev/null
+                run_timeout 5 tmux send-keys -t "$PANE_TARGET" "copilot --yolo" 2>/dev/null
                 sleep 0.3
-                timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
+                run_timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
                 sleep 3
                 return 0
             fi
@@ -400,12 +557,12 @@ send_cli_command() {
     # Clear stale input first, then send command (text and Enter separated for Codex TUI)
     # Codex CLI: C-c when idle causes CLI to exit — skip it
     if [[ "$effective_cli" != "codex" ]]; then
-        timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
+        run_timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
         sleep 0.5
     fi
-    timeout 5 tmux send-keys -t "$PANE_TARGET" "$actual_cmd" 2>/dev/null
+    run_timeout 5 tmux send-keys -t "$PANE_TARGET" "$actual_cmd" 2>/dev/null
     sleep 0.3
-    timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
+    run_timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
 
     # /clear needs extra wait time before follow-up
     if [[ "$actual_cmd" == "/clear" ]]; then
@@ -430,7 +587,7 @@ agent_is_busy() {
     local pane_tail
     # Only check the bottom 5 lines of the pane. Old busy markers ("esc to interrupt",
     # "Working") linger in scroll-back and cause false-busy if we scan too many lines.
-    pane_tail=$(timeout 2 tmux capture-pane -t "$PANE_TARGET" -p 2>/dev/null | tail -5)
+    pane_tail=$(run_timeout 2 tmux capture-pane -t "$PANE_TARGET" -p 2>/dev/null | tail -5)
 
     # ── Idle check (takes priority) ──
     if echo "$pane_tail" | grep -qE '(\? for shortcuts|context left)'; then
@@ -457,7 +614,7 @@ agent_is_busy() {
 # If the target pane is currently active, avoid injecting keystrokes.
 pane_is_active() {
     local active=""
-    active=$(timeout 2 tmux display-message -p -t "$PANE_TARGET" '#{pane_active}' 2>/dev/null || true)
+    active=$(run_timeout 2 tmux display-message -p -t "$PANE_TARGET" '#{pane_active}' 2>/dev/null || true)
     [ "$active" = "1" ]
 }
 
@@ -495,15 +652,15 @@ send_wakeup() {
     # Instead, show a tmux message. If not focused, we can safely send the normal nudge.
     if [ "$AGENT_ID" = "shogun" ] && pane_is_active; then
         echo "[$(date)] [DISPLAY] shogun pane is active — showing nudge: inbox${unread_count}" >&2
-        timeout 2 tmux display-message -t "$PANE_TARGET" -d 5000 "inbox${unread_count}" 2>/dev/null || true
+        run_timeout 2 tmux display-message -t "$PANE_TARGET" -d 5000 "inbox${unread_count}" 2>/dev/null || true
         return 0
     fi
 
     # 優先度3: tmux send-keys（テキストとEnterを分離 — Codex TUI対策）
     echo "[$(date)] [SEND-KEYS] Sending nudge to $PANE_TARGET for $AGENT_ID" >&2
-    if timeout 5 tmux send-keys -t "$PANE_TARGET" "$nudge" 2>/dev/null; then
+    if run_timeout 5 tmux send-keys -t "$PANE_TARGET" "$nudge" 2>/dev/null; then
         sleep 0.3
-        timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
+        run_timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
         echo "[$(date)] Wake-up sent to $AGENT_ID (${unread_count} unread)" >&2
         return 0
     fi
@@ -554,17 +711,17 @@ send_wakeup_with_escape() {
 
     echo "[$(date)] [SEND-KEYS] ESCALATION Phase 2: Escape×2 + nudge for $AGENT_ID (cli=$effective_cli)" >&2
     # Escape×2 to exit any mode
-    timeout 5 tmux send-keys -t "$PANE_TARGET" Escape Escape 2>/dev/null
+    run_timeout 5 tmux send-keys -t "$PANE_TARGET" Escape Escape 2>/dev/null
     sleep 0.5
     # C-c to clear stale input (but Codex CLI terminates on C-c when idle, so skip it)
     if [[ "$effective_cli" != "codex" ]]; then
-        timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
+        run_timeout 5 tmux send-keys -t "$PANE_TARGET" C-c 2>/dev/null
         sleep 0.5
         c_ctrl_state="sent"
     fi
-    if timeout 5 tmux send-keys -t "$PANE_TARGET" "$nudge" 2>/dev/null; then
+    if run_timeout 5 tmux send-keys -t "$PANE_TARGET" "$nudge" 2>/dev/null; then
         sleep 0.3
-        timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
+        run_timeout 5 tmux send-keys -t "$PANE_TARGET" Enter 2>/dev/null
         echo "[$(date)] Escape+nudge sent to $AGENT_ID (${unread_count} unread, cli=$effective_cli, C-c=$c_ctrl_state)" >&2
         return 0
     fi
@@ -593,7 +750,7 @@ process_unread() {
         if ! agent_is_busy; then
             # Shogun is human-controlled; never clear the input line automatically.
             if [ "$AGENT_ID" != "shogun" ]; then
-                timeout 2 tmux send-keys -t "$PANE_TARGET" C-u 2>/dev/null
+                run_timeout 2 tmux send-keys -t "$PANE_TARGET" C-u 2>/dev/null
             fi
         fi
         return 0
@@ -722,7 +879,7 @@ for s in data.get('specials', []):
         if ! agent_is_busy; then
             # Shogun is human-controlled; never clear the input line automatically.
             if [ "$AGENT_ID" != "shogun" ]; then
-                timeout 2 tmux send-keys -t "$PANE_TARGET" C-u 2>/dev/null
+                run_timeout 2 tmux send-keys -t "$PANE_TARGET" C-u 2>/dev/null
             fi
         fi
     fi
@@ -738,32 +895,34 @@ if [ "${__INBOX_WATCHER_TESTING__:-}" != "1" ]; then
 # ─── Startup: process any existing unread messages ───
 process_unread_once
 
-# ─── Main loop: event-driven via inotifywait ───
-# Timeout 30s: WSL2 /mnt/c/ can miss inotify events.
+# ─── Main loop: event-driven via selected backend ───
+# Timeout 30s: WSL2 /mnt/c/ can miss file watch events.
 # Shorter timeout = faster escalation retry for stuck agents.
-INOTIFY_TIMEOUT=30
+if ! resolve_watch_backend; then
+    exit 1
+fi
+echo "[$(date)] inbox_watcher backend resolved — agent: $AGENT_ID, backend: $WATCH_BACKEND, timeout: ${INBOX_WATCH_TIMEOUT_SEC}s" >&2
 
 while true; do
-    # Block until file is modified OR timeout (safety net for WSL2)
-    # set +e: inotifywait returns 2 on timeout, which would kill script under set -e
+    # Block until file is modified OR timeout (safety net for WSL2/macOS)
     set +e
-    inotifywait -q -t "$INOTIFY_TIMEOUT" -e modify -e close_write "$INBOX" 2>/dev/null
+    wait_for_inbox_event
     rc=$?
     set -e
 
     # rc=0: event fired (instant delivery)
-    # rc=1: watch invalidated — Claude Code uses atomic write (tmp+rename),
-    #        which replaces the inode. inotifywait sees DELETE_SELF → rc=1.
-    #        File still exists with new inode. Treat as event, re-watch next loop.
-    # rc=2: timeout (30s safety net for WSL2 inotify gaps)
-    # All cases: check for unread, then loop back to inotifywait (re-watches new inode)
+    # rc=2: timeout (safety net for missed events)
+    # rc=1: backend error (best-effort: still run unread processing)
     sleep 0.3
 
     if [ "$rc" -eq 2 ]; then
         if [ "${ASW_PROCESS_TIMEOUT:-1}" = "1" ]; then
             process_unread "timeout"
         fi
+    elif [ "$rc" -eq 0 ]; then
+        process_unread "event"
     else
+        echo "[$(date)] [WARN] watcher backend returned rc=$rc for $AGENT_ID (backend=$WATCH_BACKEND)" >&2
         process_unread "event"
     fi
 done

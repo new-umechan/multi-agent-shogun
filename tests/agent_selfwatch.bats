@@ -77,9 +77,11 @@ teardown() {
     grep -q "process_unread_once" "$WATCHER_SCRIPT"
 }
 
-@test "TC-FR-002: inotify + timeout fallback is configured" {
-    grep -q "INOTIFY_TIMEOUT=" "$WATCHER_SCRIPT"
-    grep -F -q 'inotifywait -q -t "$INOTIFY_TIMEOUT" -e modify -e close_write "$INBOX"' "$WATCHER_SCRIPT"
+@test "TC-FR-002: watcher backend auto-select + timeout fallback is configured" {
+    grep -q "INBOX_WATCH_BACKEND=" "$WATCHER_SCRIPT"
+    grep -q "INBOX_WATCH_TIMEOUT_SEC=" "$WATCHER_SCRIPT"
+    grep -q "resolve_watch_backend()" "$WATCHER_SCRIPT"
+    grep -q "wait_for_inbox_event()" "$WATCHER_SCRIPT"
 }
 
 @test "TC-FR-003: get_unread_info routes task/special messages correctly" {

@@ -709,3 +709,91 @@ PY
     ! grep -q "send-keys.*/model" "$MOCK_LOG"
     echo "$output" | grep -q "not supported on copilot"
 }
+
+# --- T-WATCH-001: backend auto prefers inotify when available ---
+
+@test "T-WATCH-001: resolve_watch_backend auto selects inotify when inotifywait exists" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        mkdir -p "'"$TEST_TMPDIR"'/bin"
+        cat > "'"$TEST_TMPDIR"'/bin/inotifywait" << "EOF"
+#!/bin/bash
+exit 0
+EOF
+        chmod +x "'"$TEST_TMPDIR"'/bin/inotifywait"
+        PATH="'"$TEST_TMPDIR"'/bin:/usr/bin:/bin:$PATH"
+        INBOX_WATCH_BACKEND="auto"
+        resolve_watch_backend
+        echo "WATCH_BACKEND=$WATCH_BACKEND"
+    '
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "WATCH_BACKEND=inotify"
+}
+
+# --- T-WATCH-002: backend auto uses fswatch on Darwin ---
+
+@test "T-WATCH-002: resolve_watch_backend auto selects fswatch on Darwin when inotifywait is absent" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        mkdir -p "'"$TEST_TMPDIR"'/bin"
+        cat > "'"$TEST_TMPDIR"'/bin/fswatch" << "EOF"
+#!/bin/bash
+exit 0
+EOF
+        chmod +x "'"$TEST_TMPDIR"'/bin/fswatch"
+        uname() { echo "Darwin"; }
+        export -f uname
+        PATH="'"$TEST_TMPDIR"'/bin:/usr/bin:/bin"
+        INBOX_WATCH_BACKEND="auto"
+        resolve_watch_backend
+        echo "WATCH_BACKEND=$WATCH_BACKEND"
+    '
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "WATCH_BACKEND=fswatch"
+}
+
+# --- T-WATCH-003: backend auto-install fswatch via brew on Darwin ---
+
+@test "T-WATCH-003: resolve_watch_backend auto-installs fswatch via brew on Darwin" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        mkdir -p "'"$TEST_TMPDIR"'/bin"
+        cat > "'"$TEST_TMPDIR"'/bin/brew" << "EOF"
+#!/bin/bash
+if [ "$1" = "install" ] && [ "$2" = "fswatch" ]; then
+    cat > "'"$TEST_TMPDIR"'/bin/fswatch" << "EOS"
+#!/bin/bash
+exit 0
+EOS
+    chmod +x "'"$TEST_TMPDIR"'/bin/fswatch"
+    exit 0
+fi
+exit 1
+EOF
+        chmod +x "'"$TEST_TMPDIR"'/bin/brew"
+        uname() { echo "Darwin"; }
+        export -f uname
+        PATH="'"$TEST_TMPDIR"'/bin:/usr/bin:/bin"
+        INBOX_WATCH_BACKEND="auto"
+        INBOX_AUTO_INSTALL_FSWATCH=1
+        resolve_watch_backend
+        echo "WATCH_BACKEND=$WATCH_BACKEND"
+    '
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "WATCH_BACKEND=fswatch"
+}
+
+# --- T-WATCH-004: fail on Darwin when brew is unavailable ---
+
+@test "T-WATCH-004: resolve_watch_backend fails on Darwin if fswatch and brew are missing" {
+    run bash -c '
+        source "'"$TEST_HARNESS"'"
+        uname() { echo "Darwin"; }
+        export -f uname
+        PATH="/usr/bin:/bin"
+        INBOX_WATCH_BACKEND="auto"
+        INBOX_AUTO_INSTALL_FSWATCH=1
+        resolve_watch_backend
+    '
+    [ "$status" -eq 1 ]
+}

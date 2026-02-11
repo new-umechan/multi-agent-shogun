@@ -214,10 +214,10 @@ load_adapter_with() {
     [ "$result" = "codex" ]
 }
 
-@test "get_cli_type: 空agent_id → claude" {
-    load_adapter_with "${TEST_TMP}/settings_mixed.yaml"
+@test "get_cli_type: 空agent_id → default継承" {
+    load_adapter_with "${TEST_TMP}/settings_codex_default.yaml"
     result=$(get_cli_type "")
-    [ "$result" = "claude" ]
+    [ "$result" = "codex" ]
 }
 
 # --- 全ashigaru パターン ---

@@ -20,31 +20,92 @@ CLI_ADAPTER_ALLOWED_CLIS="claude codex copilot kimi"
 # --- 内部ヘルパー ---
 
 # _cli_adapter_read_yaml key [fallback]
-# python3でsettings.yamlから値を読み取る
+# settings.yamlから値を読み取る（PyYAML非依存）
 _cli_adapter_read_yaml() {
     local key_path="$1"
     local fallback="${2:-}"
     local result
-    result=$(python3 -c "
-import yaml, sys
-try:
-    with open('${CLI_ADAPTER_SETTINGS}') as f:
-        cfg = yaml.safe_load(f) or {}
-    keys = '${key_path}'.split('.')
-    val = cfg
-    for k in keys:
-        if isinstance(val, dict):
-            val = val.get(k)
-        else:
-            val = None
+    result=$(python3 - "${CLI_ADAPTER_SETTINGS}" "${key_path}" "${fallback}" << 'PY' 2>/dev/null
+import re
+import sys
+
+settings_path = sys.argv[1]
+key_path = sys.argv[2]
+fallback = sys.argv[3]
+
+def strip_inline_comment(line: str) -> str:
+    out = []
+    in_single = False
+    in_double = False
+    for ch in line:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            continue
+        if ch == "#" and not in_single and not in_double:
             break
-    if val is not None:
-        print(val)
-    else:
-        print('${fallback}')
+        out.append(ch)
+    return "".join(out).rstrip()
+
+def parse_scalar(raw: str) -> str:
+    val = raw.strip()
+    if len(val) >= 2 and ((val[0] == "'" and val[-1] == "'") or (val[0] == '"' and val[-1] == '"')):
+        return val[1:-1]
+    return val
+
+root = {}
+stack = [(-1, root)]
+
+try:
+    with open(settings_path, encoding="utf-8") as f:
+        for raw in f:
+            line = strip_inline_comment(raw.rstrip("\n"))
+            if not line.strip():
+                continue
+
+            m = re.match(r"^(\s*)([^:\s][^:]*):\s*(.*)$", line)
+            if not m:
+                continue
+
+            indent = len(m.group(1).replace("\t", "    "))
+            key = m.group(2).strip()
+            rest = m.group(3)
+
+            while len(stack) > 1 and indent <= stack[-1][0]:
+                stack.pop()
+
+            parent = stack[-1][1]
+            if not isinstance(parent, dict):
+                continue
+
+            if rest == "":
+                node = {}
+                parent[key] = node
+                stack.append((indent, node))
+            else:
+                parent[key] = parse_scalar(rest)
 except Exception:
-    print('${fallback}')
-" 2>/dev/null)
+    print(fallback)
+    sys.exit(0)
+
+val = root
+for part in key_path.split("."):
+    if isinstance(val, dict) and part in val:
+        val = val[part]
+    else:
+        print(fallback)
+        sys.exit(0)
+
+if isinstance(val, (dict, list)):
+    print(fallback)
+else:
+    print(val)
+PY
+)
     if [[ -z "$result" ]]; then
         echo "$fallback"
     else
@@ -71,51 +132,39 @@ _cli_adapter_is_valid_cli() {
 get_cli_type() {
     local agent_id="$1"
     if [[ -z "$agent_id" ]]; then
-        echo "claude"
+        local default_cli
+        default_cli=$(_cli_adapter_read_yaml "cli.default" "claude")
+        if _cli_adapter_is_valid_cli "$default_cli"; then
+            echo "$default_cli"
+        else
+            echo "claude"
+        fi
         return 0
     fi
 
     local result
-    result=$(python3 -c "
-import yaml, sys
-try:
-    with open('${CLI_ADAPTER_SETTINGS}') as f:
-        cfg = yaml.safe_load(f) or {}
-    cli = cfg.get('cli', {})
-    if not isinstance(cli, dict):
-        print('claude'); sys.exit(0)
-    agents = cli.get('agents', {})
-    if not isinstance(agents, dict):
-        print(cli.get('default', 'claude') if cli.get('default', 'claude') in ('claude','codex','copilot','kimi') else 'claude')
-        sys.exit(0)
-    agent_cfg = agents.get('${agent_id}')
-    if isinstance(agent_cfg, dict):
-        t = agent_cfg.get('type', '')
-        if t in ('claude', 'codex', 'copilot', 'kimi'):
-            print(t); sys.exit(0)
-    elif isinstance(agent_cfg, str):
-        if agent_cfg in ('claude', 'codex', 'copilot', 'kimi'):
-            print(agent_cfg); sys.exit(0)
-    default = cli.get('default', 'claude')
-    if default in ('claude', 'codex', 'copilot', 'kimi'):
-        print(default)
-    else:
-        print('claude', file=sys.stderr)
-        print('claude')
-except Exception as e:
-    print('claude', file=sys.stderr)
-    print('claude')
-" 2>/dev/null)
 
-    if [[ -z "$result" ]]; then
-        echo "claude"
+    # dict形式: cli.agents.{id}.type
+    result=$(_cli_adapter_read_yaml "cli.agents.${agent_id}.type" "")
+    if _cli_adapter_is_valid_cli "$result"; then
+        echo "$result"
+        return 0
+    fi
+
+    # 文字列形式: cli.agents.{id}: codex
+    result=$(_cli_adapter_read_yaml "cli.agents.${agent_id}" "")
+    if _cli_adapter_is_valid_cli "$result"; then
+        echo "$result"
+        return 0
+    fi
+
+    # default
+    result=$(_cli_adapter_read_yaml "cli.default" "claude")
+    if _cli_adapter_is_valid_cli "$result"; then
+        echo "$result"
     else
-        if ! _cli_adapter_is_valid_cli "$result"; then
-            echo "[WARN] Invalid CLI type '$result' for agent '$agent_id'. Falling back to 'claude'." >&2
-            echo "claude"
-        else
-            echo "$result"
-        fi
+        echo "[WARN] Invalid CLI type '$result' for agent '$agent_id'. Falling back to 'claude'." >&2
+        echo "claude"
     fi
 }
 

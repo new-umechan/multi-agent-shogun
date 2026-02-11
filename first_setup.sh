@@ -502,6 +502,11 @@ language: ja
 # zsh: zsh用プロンプト
 shell: bash
 
+# CLI設定
+cli:
+    # 全エージェントの既定CLI（claude | codex | copilot | kimi）
+    default: codex
+
 # スキル設定
 skill:
   # スキル保存先（スキル名に shogun- プレフィックスを付けて保存）
